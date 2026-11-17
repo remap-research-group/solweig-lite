@@ -1,0 +1,311 @@
+#SOLWEIG-GPU: GPU-accelerated SOLWEIG model for urban thermal comfort simulation
+#Copyright (C) 2022–2025 Harsh Kamath and Naveen Sudharsan
+
+#This program is free software: you can redistribute it and/or modify
+#it under the terms of the GNU General Public License as published by
+#the Free Software Foundation, either version 3 of the License, or
+#(at your option) any later version.
+
+#This program is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#GNU General Public License for more details.
+# CPU adaptation preserves the pinned upstream compatibility behavior.
+"""All fifteen SVF fields and three lossless visibility channels."""
+import os
+import tempfile
+import zipfile
+import numpy as np
+from numba import njit, prange
+from ..radiation._jit_cache import bind_cache_identity
+from .shadows import prepare_shadow, create_patches
+
+
+def _annulus_weight_numpy(altitude, aziinterval):
+    n=np.float32(90)
+    altitude=np.asarray(altitude)
+    # Integer inputs become float32 when mixed with the default floating scalar.
+    annulus=np.float32(91)-np.float32(altitude)
+    interval=np.float32(aziinterval)
+    steprad=(np.reciprocal(interval)*np.float32(360))*np.float32(np.pi/180)
+    w=np.float32(1/(2*np.pi))*np.sin(np.float32(np.pi)/(np.float32(2)*n))*np.sin((np.float32(np.pi)*(np.float32(2)*annulus-np.float32(1)))/(np.float32(2)*n))
+    return steprad*w
+
+
+@njit(cache=True, fastmath=False, error_model="numpy")
+def _annulus_weight_scalar(altitude, interval):
+    """Preserve reflected scalar division and native float32 sine calls."""
+    n = np.float32(90)
+    annulus = np.float32(91) - altitude
+    steprad = ((np.float32(1) / interval) * np.float32(360)) * np.float32(np.pi / 180)
+    # Upstream Python scalar / tensor uses reciprocal then multiply.
+    angle = (np.float32(1) / (np.float32(2) * n)) * np.float32(np.pi)
+    other = (np.float32(np.pi) * (np.float32(2) * annulus - np.float32(1))) / (np.float32(2) * n)
+    weight = np.float32(1 / (2 * np.pi)) * np.sin(angle) * np.sin(other)
+    return np.float32(steprad * weight)
+
+
+def annulus_weight(altitude, aziinterval):
+    if np.ndim(altitude) or np.ndim(aziinterval):
+        return _annulus_weight_numpy(altitude, aziinterval)
+    return np.float32(_annulus_weight_scalar(np.float32(altitude), np.float32(aziinterval)))
+
+
+@njit(cache=True, fastmath=False, parallel=True)
+@bind_cache_identity
+def _accumulate_patch_f32(fields, masks, weights, directional_weights, directions):
+    """Independent pixels retain every annulus product and float32 store.
+
+    Factoring a mask out of the annulus sum changes float32 rounding. Each
+    multiply and each addition rounds independently, including accumulator
+    values held locally between stores. Patch and annulus order are unchanged;
+    there is no cross-pixel reduction or shared output ownership.
+    """
+    rows, cols = masks[0].shape
+    for pixel in prange(rows * cols):
+        row, col = pixel // cols, pixel % cols
+        for channel in range(3):
+            offset = channel * 5
+            mask = masks[channel][row, col]
+            total = fields[offset][row, col]
+            east = fields[offset + 1][row, col]
+            south = fields[offset + 2][row, col]
+            west = fields[offset + 3][row, col]
+            north = fields[offset + 4][row, col]
+            for annulus in range(len(weights)):
+                product = np.float32(weights[annulus] * mask)
+                total = np.float32(total + product)
+                directional_product = np.float32(directional_weights[annulus] * mask)
+                if directions[0]:
+                    east = np.float32(east + directional_product)
+                if directions[1]:
+                    south = np.float32(south + directional_product)
+                if directions[2]:
+                    west = np.float32(west + directional_product)
+                if directions[3]:
+                    north = np.float32(north + directional_product)
+            fields[offset][row, col] = total
+            fields[offset + 1][row, col] = east
+            fields[offset + 2][row, col] = south
+            fields[offset + 3][row, col] = west
+            fields[offset + 4][row, col] = north
+
+
+def _accumulate_patch_numpy(fields, masks, weights, directional_weights, directions):
+    """Legacy array arithmetic for low-level inputs outside float32 admission."""
+    for wt, wd in zip(weights, directional_weights):
+        for channel, mask in enumerate(masks):
+            offset = channel * 5
+            fields[offset] += wt * mask
+            for direction, active in enumerate(directions):
+                if active:
+                    fields[offset + direction + 1] += wd * mask
+
+
+@njit(cache=True, fastmath=False, parallel=True)
+@bind_cache_identity
+def _count_binary_patch(counts, masks, directions):
+    """Count exact +0/1 masks; flag other values for the ordered fallback."""
+    rows, cols = masks[0].shape
+    invalid = 0
+    for pixel in prange(rows * cols):
+        row, col = pixel // cols, pixel % cols
+        for channel in range(3):
+            value = masks[channel][row, col]
+            if value == np.float32(1):
+                offset = channel * 5
+                counts[offset, pixel] += 1
+                for direction in range(4):
+                    if directions[direction]:
+                        counts[offset + direction + 1, pixel] += 1
+            elif value != np.float32(0) or np.signbit(value):
+                invalid += 1
+    return invalid
+
+
+@njit(cache=True, fastmath=False, parallel=True)
+@bind_cache_identity
+def _replay_binary_counts(keys, weights, lengths):
+    """Replay each positive annulus update, retaining its float32 rounding.
+
+    Each key stores eight byte counts in band order. Within a band every
+    visible patch applies the same transition. Invisible +0 updates are
+    identities on the nonnegative accumulators; no weights are reassociated.
+    """
+    result = np.empty(keys.size, np.float32)
+    for index in prange(keys.size):
+        value = np.float32(0)
+        key = keys[index]
+        for band in range(8):
+            count = int((key >> np.uint64(8 * band)) & np.uint64(255))
+            for patch in range(count):
+                for annulus in range(lengths[band]):
+                    value = np.float32(value + weights[band, annulus])
+        result[index] = value
+    return result
+
+
+def _finish_binary_counts(fields, counts, weights, directional_weights):
+    lengths = np.array([len(band) for band in weights], dtype=np.int64)
+    tables = []
+    for bands in (weights, directional_weights):
+        table = np.zeros((8, int(lengths.max())), dtype=np.float32)
+        for band, values in enumerate(bands):
+            table[band, :len(values)] = values
+        tables.append(table)
+    # Group one field at a time, bounding sorting and inverse-map scratch.
+    for index, field in enumerate(fields):
+        octets = np.ascontiguousarray(counts[:, index, :].T)
+        keys = octets.view('<u8').reshape(-1).astype(np.uint64, copy=False)
+        unique, inverse = np.unique(keys, return_inverse=True)
+        values = _replay_binary_counts(unique, tables[index % 5 != 0], lengths)
+        field.flat = values[inverse]
+
+
+def save_raster_like_gdal(template,path,array):
+    from osgeo import gdal
+    gdal.UseExceptions()
+    rows,cols=array.shape
+    ds=gdal.GetDriverByName('GTiff').Create(str(path),cols,rows,1,gdal.GDT_Float32)
+    ds.SetGeoTransform(template.GetGeoTransform());ds.SetProjection(template.GetProjection())
+    ds.GetRasterBand(1).WriteArray(np.asarray(array,dtype=np.float32));ds.FlushCache()
+    ds=None
+
+
+def save_svf_zip_npz_outputs(output_dir,gdal_dsm,svf,svfE,svfS,svfW,svfN,svfveg,svfEveg,svfSveg,svfWveg,svfNveg,svfaveg,svfEaveg,svfSaveg,svfWaveg,svfNaveg,shmat,vegshmat,vbshvegshmat,svftotal,number=None):
+    if output_dir is None or gdal_dsm is None:
+        raise ValueError('output_dir and gdal_dsm are required to save SVF rasters')
+    os.makedirs(output_dir,exist_ok=True)
+    suffix=f'_{number}' if number is not None else ''
+    names=['svf','svfE','svfS','svfW','svfN','svfveg','svfEveg','svfSveg','svfWveg','svfNveg','svfaveg','svfEaveg','svfSaveg','svfWaveg','svfNaveg']
+    arrays=[svf,svfE,svfS,svfW,svfN,svfveg,svfEveg,svfSveg,svfWveg,svfNveg,svfaveg,svfEaveg,svfSaveg,svfWaveg,svfNaveg]
+    # Isolate export scratch for different logical tiles/calls.
+    with tempfile.TemporaryDirectory(prefix='.svf-',dir=output_dir) as tmp:
+        zpath=os.path.join(tmp,'svfs.zip')
+        with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED) as z:
+            for name,array in zip(names,arrays):
+                p=os.path.join(tmp,name+'.tif');save_raster_like_gdal(gdal_dsm,p,array);z.write(p,name+'.tif')
+        total=os.path.join(tmp,'total.tif');save_raster_like_gdal(gdal_dsm,total,svftotal)
+        mats=os.path.join(tmp,'mats.npz')
+        from .visibility import PackedVisibility, export_visibility_npz
+        channels = [value if isinstance(value, PackedVisibility) else
+                    PackedVisibility.from_dense(np.asarray(value, dtype=np.float32))
+                    for value in (shmat, vegshmat, vbshvegshmat)]
+        export_visibility_npz(mats, *channels)
+        for src,dst in [(zpath,f'svfs{suffix}.zip'),(total,f'SkyViewFactor{suffix}.tif'),(mats,f'shadowmats{suffix}.npz')]:
+            os.replace(src,os.path.join(output_dir,dst))
+
+
+def _calculate_svf(patch_option,amaxvalue=None,a=None,vegdem=None,vegdem2=None,bush=None,scale=None,save_rasters=False,building_dsm_path=None,tree_path=None,dem_path=None,output_dir=None,number=None,gdal_dsm=None,*,compact=False):
+    template=gdal_dsm
+    required=[amaxvalue,a,vegdem,vegdem2,bush,scale]
+    if save_rasters:
+        from osgeo import gdal
+        gdal.UseExceptions()
+        if output_dir is None:raise ValueError('When save_rasters=True, output_dir must be provided.')
+        if any(x is None for x in required):
+            if any(x is None for x in [building_dsm_path,tree_path,dem_path]):raise ValueError('building_dsm_path, tree_path, and dem_path must be provided')
+            template=gdal.Open(str(building_dsm_path));a=template.GetRasterBand(1).ReadAsArray().astype(np.float32)
+            tree=gdal.Open(str(tree_path)).ReadAsArray().astype(np.float32)
+            dem=gdal.Open(str(dem_path)).ReadAsArray().astype(np.float32)
+            scale=1/template.GetGeoTransform()[1];tree[tree<0]=0
+            height=tree+dem;trunkheight=tree*np.float32(.25)+dem
+            bush=np.logical_not(trunkheight*height)*height
+            vegdem=tree+a;vegdem[vegdem==a]=0
+            vegdem2=tree*np.float32(.25)+a;vegdem2[vegdem2==a]=0
+            amaxvalue=np.maximum(a.max(),height.max())
+        elif template is None:
+            if building_dsm_path is None:raise ValueError('provide either gdal_dsm or building_dsm_path')
+            template=gdal.Open(str(building_dsm_path))
+    elif any(x is None for x in required):
+        raise ValueError('amaxvalue, a, vegdem, vegdem2, bush and scale must be provided')
+    a=np.asarray(a);shape=a.shape
+    fields=[np.zeros(shape,dtype=np.float32) for _ in range(15)]
+    _,_,ann,alts,counts,steps,starts=create_patches(patch_option)
+    # Option 4 reaches a floating range bound upstream and raises TypeError.
+    if ann.dtype.kind=='f':raise TypeError('only integer tensors of a single element can be converted to an index')
+    azis=np.zeros(sum(counts),dtype=np.float32)
+    index=0
+    for band in range(len(alts)):
+        for k in range(int(np.reciprocal(steps[band])*np.float32(360))):
+            azis[index]=np.float32(k)*steps[band]+np.float32(starts[band])
+            if azis[index]>360:azis[index]-=np.float32(360)
+            index+=1
+    if compact:
+        from .visibility import VisibilityBuilder
+        mats = [VisibilityBuilder((*shape, int(sum(counts)))) for _ in range(3)]
+    else:
+        mats=[np.zeros((*shape,sum(counts)),dtype=np.float32) for _ in range(3)]
+    anis=np.ceil(counts.astype(np.float32)/np.float32(2))
+    # The scalar weight implementation remains the numerical authority. Its
+    # float32 results are invariant across patches within the same band.
+    weights = [np.array([annulus_weight(k, counts[band])
+                        for k in range(ann[band]+1, ann[band+1]+1)], dtype=np.float32)
+               for band in range(len(alts))]
+    directional_weights = [np.array([annulus_weight(k, anis[band])
+                                    for k in range(ann[band]+1, ann[band+1]+1)], dtype=np.float32)
+                           for band in range(len(alts))]
+    admitted = all(np.asarray(value).dtype == np.dtype(np.float32)
+                   for value in (a, vegdem, vegdem2, bush))
+    accumulate = _accumulate_patch_f32 if admitted else _accumulate_patch_numpy
+    field_arrays = tuple(fields) if admitted else fields
+    cast_shadow = prepare_shadow(a, vegdem, vegdem2, bush)
+    # The finite no-bush tracer produces only canonical +0/1/2 masks. Its
+    # rare ternary result uses the original ordered replay below. General
+    # low-level inputs retain the original eager arithmetic and errors.
+    count_masks = (compact and admitted and len(alts) == 8 and max(counts) < 256
+                   and all(np.isfinite(value).all() for value in (a, vegdem, vegdem2, bush))
+                   and not bool(np.max(bush) > 0))
+    band_counts = np.zeros((8, 15, a.size), dtype=np.uint8) if count_masks else None
+    binary = True
+    index=0
+    for band in range(len(alts)):
+        for j in range(counts[band]):
+            azi=azis[index]
+            masks=cast_shadow(amaxvalue,azi,alts[band],scale)
+            for mat,mask in zip(mats,masks):
+                if compact: mat.append(mask)
+                else: mat[:,:,index]=mask
+            directions=[0<=azi<180,90<=azi<270,180<=azi<360,azi>=270 or azi<90]
+            if count_masks:
+                binary = binary and _count_binary_patch(band_counts[band], masks,
+                                               np.asarray(directions, dtype=np.bool_)) == 0
+            else:
+                accumulate(field_arrays, masks, weights[band], directional_weights[band],
+                           np.asarray(directions, dtype=np.bool_))
+            index+=1
+    shmat,vegmat,vbmat = [mat.finish() for mat in mats] if compact else mats
+    if count_masks:
+        if binary:
+            _finish_binary_counts(fields, band_counts, weights, directional_weights)
+        else:
+            index = 0
+            for band in range(len(alts)):
+                for _ in range(counts[band]):
+                    azi = azis[index]
+                    masks = tuple(mat.decode_patch(index) for mat in (shmat, vegmat, vbmat))
+                    directions = np.array([0 <= azi < 180, 90 <= azi < 270,
+                                           180 <= azi < 360, azi >= 270 or azi < 90])
+                    accumulate(field_arrays, masks, weights[band], directional_weights[band], directions)
+                    index += 1
+        del band_counts
+    fields[2]+=np.float32(3.0459e-4);fields[3]+=np.float32(3.0459e-4)
+    last=np.zeros(shape,dtype=np.float32);last[np.asarray(vegdem2)==0]=np.float32(3.0459e-4)
+    for i in (7,8,12,13):fields[i]+=last
+    for field in fields:field[field>1]=1
+    total=fields[0]-(np.float32(1)-fields[5])*(np.float32(1)-np.float32(.03))
+    if save_rasters:save_svf_zip_npz_outputs(output_dir,template,*fields,shmat,vegmat,vbmat,total,number)
+    # Preserve the actual executed upstream tuple order (not its stale docstring).
+    order=[0,10,1,11,6,4,14,9,2,12,7,5,3,13,8]
+    return tuple(fields[i] for i in order)+(vegmat,vbmat,shmat,total)
+
+
+def svf_calculator(patch_option,amaxvalue=None,a=None,vegdem=None,vegdem2=None,bush=None,scale=None,save_rasters=False,building_dsm_path=None,tree_path=None,dem_path=None,output_dir=None,number=None,gdal_dsm=None):
+    """Legacy low-level ndarray return contract, with bounded export scratch."""
+    return _calculate_svf(patch_option,amaxvalue,a,vegdem,vegdem2,bush,scale,save_rasters,
+                         building_dsm_path,tree_path,dem_path,output_dir,number,gdal_dsm)
+
+
+def svf_calculator_compact(*args, **kwargs):
+    """Native geometry path: encode each patch immediately without float cubes."""
+    return _calculate_svf(*args, **kwargs, compact=True)
